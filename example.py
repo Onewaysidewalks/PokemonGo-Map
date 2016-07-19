@@ -59,10 +59,15 @@ deflat, deflng = 0, 0
 default_step = 0.001
 api_endpoint = None
 pokemons = []
+pokemonSwap = []
 gyms = []
 pokestops = []
 numbertoteam = {0: "Gym", 1: "Mystic", 2: "Valor", 3: "Instinct"} # At least I'm pretty sure that's it. I could be wrong and then I'd be displaying the wrong owner team of gyms.
-
+#Static data variables
+full_path = ""
+path= ""
+filename = ""
+pokemonsJSON = {}
 
 # stuff for in-background search thread
 search_thread = None
@@ -73,7 +78,7 @@ def parse_unicode(bytestring):
 
 def debug(message):
     if DEBUG:
-        print('[-] {}'.format(message))
+        app.logger.info('[-] {}'.format(message))
 
 def time_left(ms):
     s = ms / 1000
@@ -132,8 +137,8 @@ def retrying_set_location(location_name):
 def set_location(location_name):
     geolocator = GoogleV3()
     loc = geolocator.geocode(location_name)
-    print('[!] Your given location: {}'.format(loc.address.encode('utf-8')))
-    print('[!] lat/long/alt: {} {} {}'.format(loc.latitude, loc.longitude, loc.altitude))
+    debug('[!] Your given location: {}'.format(loc.address.encode('utf-8')))
+    debug('[!] lat/long/alt: {} {} {}'.format(loc.latitude, loc.longitude, loc.altitude))
     global deflat
     global deflng
     deflat, deflng = loc.latitude, loc.longitude
@@ -264,14 +269,14 @@ def get_profile(service, access_token, api, useauth, *reqq):
     return retrying_api_req(service, api, access_token, req, useauth=useauth)
 
 def login_google(username, password):
-    print('[!] Google login for: {}'.format(username))
+    debug('[!] Google login for: {}'.format(username))
     r1 = perform_master_login(username, password, ANDROID_ID)
     r2 = perform_oauth(username, r1.get('Token', ''), ANDROID_ID, SERVICE, APP,
         CLIENT_SIG)
     return r2.get('Auth')
 
 def login_ptc(username, password):
-    print('[!] PTC login for: {}'.format(username))
+    debug('[!] PTC login for: {}'.format(username))
     head = {'User-Agent': 'Niantic App'}
     r = SESSION.get(LOGIN_URL, headers=head)
     if r is None:
@@ -285,7 +290,7 @@ def login_ptc(username, password):
 
     # Maximum password length is 15 (sign in page enforces this limit, API does not)
     if len(password) > 15:
-        print('[!] Trimming password to 15 characters')
+        debug('[!] Trimming password to 15 characters')
         password = password[:15]
 
     data = {
@@ -302,7 +307,7 @@ def login_ptc(username, password):
         ticket = re.sub('.*ticket=', '', r1.history[0].headers['Location'])
     except Exception as e:
         if DEBUG:
-            print(r1.json()['errors'][0])
+            debug(r1.json()['errors'][0])
         return None
 
     data1 = {
@@ -371,13 +376,13 @@ def get_token(service, username, password):
     else:
         return global_token
 
-def get_args():
+def get_args(validate=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("-a", "--auth_service", help="Auth Service", default="ptc")
-    parser.add_argument("-u", "--username", help="Username", required=True)
-    parser.add_argument("-p", "--password", help="Password", required=True)
-    parser.add_argument("-l", "--location", type=parse_unicode, help="Location", required=True)
-    parser.add_argument("-st", "--step_limit", help="Steps", required=True)
+    parser.add_argument("-u", "--username", help="Username", required=validate)
+    parser.add_argument("-p", "--password", help="Password", required=validate)
+    parser.add_argument("-l", "--location", type=parse_unicode, help="Location", required=validate)
+    parser.add_argument("-st", "--step_limit", help="Steps", required=validate)
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("-i", "--ignore", help="Pokemon to ignore (comma separated)")
     group.add_argument("-o", "--only", help="Only look for these pokemon (comma separated)")
@@ -390,142 +395,180 @@ def get_args():
     parser.set_defaults(DEBUG=True)
     return parser.parse_args()
 
-def main():
-    debug("main")
 
-    full_path = os.path.realpath(__file__)
-    path, filename = os.path.split(full_path)
-    pokemonsJSON = json.load(open(path + '/pokemon.json'))
+def buildUserConfigs():
+    usernameCommaSeparatedList = os.environ.get('POKEMON_GO_USERS')
+    passwordCommaSeparatedList = os.environ.get('POKEMON_GO_PASSWORDS')
+    typeCommaSeparatedList = os.environ.get('POKEMON_GO_LOGIN_TYPES')
+    locationHashSeparatedList = os.environ.get('POKEMON_GO_LOCATIONS')
 
-    args = get_args()
+    if not usernameCommaSeparatedList:
+        debug("no environment variables found, using command line args")
+        return [get_args(True)] #defaults to the command line if none set
 
-    if args.auth_service not in ['ptc', 'google']:
-      print('[!] Invalid Auth service specified')
-      return
+    usernames = usernameCommaSeparatedList.split(",")
+    passwords = passwordCommaSeparatedList.split(",")
+    loginTypes = typeCommaSeparatedList.split(",")
+    locations = locationHashSeparatedList.split("#")
 
-    if args.debug:
-        global DEBUG
-        DEBUG = True
-        print('[!] DEBUG mode on')
+    userConfigs = []
+    for index, value in enumerate(usernames):
+        debug("loading user/location: %s/%s" % (usernames[index], locations[index]))
+        userConfig = lambda: None #this is the poor mans way instead of declaring a class and using every where. lets one set arbitrary field names
+        userConfig.username = usernames[index]
+        userConfig.password = passwords[index]
+        userConfig.auth_service = loginTypes[index]
+        userConfig.location = locations[index]
+        userConfig.ignore = None #TODO support this from configuration non-command line
+        userConfig.only = None #TODO support this from configuration non-command line
+        userConfig.step_limit = 5 #TODO support this from configuration non-command line
+        userConfig.china = None #TODO support this from configuration non-command line
+        userConfigs.append(userConfig)
 
-    retrying_set_location(args.location)
+    return userConfigs
 
-    access_token = get_token(args.auth_service, args.username, args.password)
-    if access_token is None:
-        print('[-] Wrong username/password')
-        return
-    print('[+] RPC Session Token: {} ...'.format(access_token[:25]))
+def performSearch():
+    global pokemons
+    global DEBUG
+    pokemonSwap = []
+    debug("performing search...")
 
-    api_endpoint = get_api_endpoint(args.auth_service, access_token)
-    if api_endpoint is None:
-        print('[-] RPC server offline')
-        return
-    print('[+] Received API endpoint: {}'.format(api_endpoint))
+    userConfigs = buildUserConfigs()
 
-    profile_response = retrying_get_profile(args.auth_service, access_token, api_endpoint, None)
-    if profile_response is None or not profile_response.payload:
-        print('[-] Ooops...')
-        raise Exception("Could not get profile")
+    for userConfig in userConfigs:
 
-    print('[+] Login successful')
+        args = userConfig
 
-    payload = profile_response.payload[0]
-    profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
-    profile.ParseFromString(payload)
-    print('[+] Username: {}'.format(profile.profile.username))
+        debug("using user/location: %s/%s" % (args.username, args.location))
 
-    creation_time = datetime.fromtimestamp(int(profile.profile.creation_time) / 1000)
-    print('[+] You started playing Pokemon Go on: {}'.format(
-        creation_time.strftime('%Y-%m-%d %H:%M:%S'),
-    ))
+        if args.auth_service not in ['ptc', 'google']:
+          debug('[!] Invalid Auth service specified')
+          return
 
-    for curr in profile.profile.currency:
-        print('[+] {}: {}'.format(curr.type, curr.amount))
+        if DEBUG:
+            debug('[!] DEBUG mode on')
 
-    origin = LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)
-    steps = 0
-    steplimit = int(args.step_limit)
+        retrying_set_location(args.location)
 
-    ignore = []
-    only = []
-    if args.ignore:
-        ignore = [i.lower().strip() for i in args.ignore.split(',')]
-    elif args.only:
-        only = [i.lower().strip() for i in args.only.split(',')]
+        access_token = get_token(args.auth_service, args.username, args.password)
+        if access_token is None:
+            debug('[-] Wrong username/password')
+            return
+        debug('[+] RPC Session Token: {} ...'.format(access_token[:25]))
 
-    pos = 1
-    x   = 0
-    y   = 0
-    dx  = 0
-    dy  = -1
-    while steps < steplimit**2:
-        debug("looping: step {} of {}".format(steps, steplimit**2))
-        original_lat = FLOAT_LAT
-        original_long = FLOAT_LONG
-        parent = CellId.from_lat_lng(LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)).parent(15)
-        h = get_heartbeat(args.auth_service, api_endpoint, access_token, profile_response)
-        hs = [h]
-        seen = set([])
-        for child in parent.children():
-            latlng = LatLng.from_point(Cell(child).get_center())
-            set_location_coords(latlng.lat().degrees, latlng.lng().degrees, 0)
-            hs.append(get_heartbeat(args.auth_service, api_endpoint, access_token, profile_response))
-        set_location_coords(original_lat, original_long, 0)
-        visible = []
-        for hh in hs:
-            try:
-                for cell in hh.cells:
-                    for wild in cell.WildPokemon:
-                        hash = wild.SpawnPointId + ':' + str(wild.pokemon.PokemonId)
-                        if (hash not in seen):
-                            visible.append(wild)
-                            seen.add(hash)
-                    if cell.Fort:
-                        for Fort in cell.Fort:
-                            if Fort.Enabled == True:
-                                if args.china:
-                                    Fort.Latitude, Fort.Longitude = transform_from_wgs_to_gcj(Location(Fort.Latitude, Fort.Longitude))
-                                if Fort.GymPoints and args.display_gym:
-                                    gyms.append([Fort.Team, Fort.Latitude, Fort.Longitude])
-                                elif Fort.FortType and args.display_pokestop:
-                                    pokestops.append([Fort.Latitude, Fort.Longitude])
-            except AttributeError:
-                break
-        for poke in visible:
-            pokename = pokemonsJSON[poke.pokemon.PokemonId - 1]['Name']
-            if args.ignore:
-                if pokename.lower() in ignore: continue
-            elif args.only:
-                if pokename.lower() not in only: continue
-            other = LatLng.from_degrees(poke.Latitude, poke.Longitude)
-            diff = other - origin
-            # print(diff)
-            difflat = diff.lat().degrees
-            difflng = diff.lng().degrees
-            
-            disappear_timestamp = time.time() + poke.TimeTillHiddenMs/1000
-            disappear_time_formatted = datetime.fromtimestamp(disappear_timestamp).strftime("%H:%M:%S")
-            disappears_at = 'disappears at %s' % (disappear_time_formatted)
+        api_endpoint = get_api_endpoint(args.auth_service, access_token)
+        if api_endpoint is None:
+            debug('[-] RPC server offline')
+            return
+        debug('[+] Received API endpoint: {}'.format(api_endpoint))
 
-            pid = str(poke.pokemon.PokemonId)
-            label = (
-                        '<div style=\'position:float; top:0;left:0;\'><small><a href=\'http://www.pokemon.com/us/pokedex/'+pid+'\' target=\'_blank\' title=\'View in Pokedex\'>#'+pid+'</a></small> - <b>'+pokemonsJSON[poke.pokemon.PokemonId - 1]['Name']+'</b></div>'
-                        '<center class=\'label-countdown\' data-disappears-at=\''+ str(disappear_timestamp)+'\'>'+disappears_at+'</center>'
-                    )
-            if args.china:
-                poke.Latitude, poke.Longitude = transform_from_wgs_to_gcj(Location(poke.Latitude, poke.Longitude))
-            pokemons.append([poke.pokemon.PokemonId, label, poke.Latitude, poke.Longitude])
+        profile_response = retrying_get_profile(args.auth_service, access_token, api_endpoint, None)
+        if profile_response is None or not profile_response.payload:
+            debug('[-] Ooops...')
+            raise Exception("Could not get profile")
 
-        #Scan location math
-        if (-steplimit/2 < x <= steplimit/2) and (-steplimit/2 < y <= steplimit/2):
-            set_location_coords((x * 0.0025) + deflat, (y * 0.0025 ) + deflng, 0)
-        if x == y or (x < 0 and x == -y) or (x > 0 and x == 1-y):
-            dx, dy = -dy, dx
-        x, y = x+dx, y+dy
-        steps += 1
-        print("Completed:", ((steps + (pos * .25) - .25) / steplimit**2) * 100, "%")
+        debug('[+] Login successful')
 
+        payload = profile_response.payload[0]
+        profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
+        profile.ParseFromString(payload)
+        debug('[+] Username: {}'.format(profile.profile.username))
+
+        creation_time = datetime.fromtimestamp(int(profile.profile.creation_time) / 1000)
+        debug('[+] You started playing Pokemon Go on: {}'.format(
+            creation_time.strftime('%Y-%m-%d %H:%M:%S'),
+        ))
+
+        for curr in profile.profile.currency:
+            debug('[+] {}: {}'.format(curr.type, curr.amount))
+
+        origin = LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)
+        steps = 0
+        steplimit = int(args.step_limit)
+
+        ignore = []
+        only = []
+        if args.ignore:
+            ignore = [i.lower().strip() for i in args.ignore.split(',')]
+        elif args.only:
+            only = [i.lower().strip() for i in args.only.split(',')]
+
+        pos = 1
+        x   = 0
+        y   = 0
+        dx  = 0
+        dy  = -1
+        while steps < steplimit**2:
+            debug("looping: step {} of {}".format(steps, steplimit**2))
+            original_lat = FLOAT_LAT
+            original_long = FLOAT_LONG
+            parent = CellId.from_lat_lng(LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)).parent(15)
+            h = get_heartbeat(args.auth_service, api_endpoint, access_token, profile_response)
+            hs = [h]
+            seen = set([])
+            for child in parent.children():
+                latlng = LatLng.from_point(Cell(child).get_center())
+                set_location_coords(latlng.lat().degrees, latlng.lng().degrees, 0)
+                hs.append(get_heartbeat(args.auth_service, api_endpoint, access_token, profile_response))
+            set_location_coords(original_lat, original_long, 0)
+            visible = []
+            for hh in hs:
+                try:
+                    for cell in hh.cells:
+                        for wild in cell.WildPokemon:
+                            hash = wild.SpawnPointId + ':' + str(wild.pokemon.PokemonId)
+                            if (hash not in seen):
+                                visible.append(wild)
+                                seen.add(hash)
+                        if cell.Fort:
+                            for Fort in cell.Fort:
+                                if Fort.Enabled == True:
+                                    if args.china:
+                                        Fort.Latitude, Fort.Longitude = transform_from_wgs_to_gcj(Location(Fort.Latitude, Fort.Longitude))
+                                    if Fort.GymPoints and args.display_gym:
+                                        gyms.append([Fort.Team, Fort.Latitude, Fort.Longitude])
+                                    elif Fort.FortType and args.display_pokestop:
+                                        pokestops.append([Fort.Latitude, Fort.Longitude])
+                except AttributeError:
+                    break
+            for poke in visible:
+                pokename = pokemonsJSON[poke.pokemon.PokemonId - 1]['Name']
+                if args.ignore:
+                    if pokename.lower() in ignore: continue
+                elif args.only:
+                    if pokename.lower() not in only: continue
+                other = LatLng.from_degrees(poke.Latitude, poke.Longitude)
+                diff = other - origin
+                # print(diff)
+                difflat = diff.lat().degrees
+                difflng = diff.lng().degrees
+
+                disappear_timestamp = time.time() + poke.TimeTillHiddenMs/1000
+                disappear_time_formatted = datetime.fromtimestamp(disappear_timestamp).strftime("%H:%M:%S")
+                disappears_at = 'disappears at %s' % (disappear_time_formatted)
+
+                pid = str(poke.pokemon.PokemonId)
+                label = (
+                            '<div style=\'position:float; top:0;left:0;\'><small><a href=\'http://www.pokemon.com/us/pokedex/'+pid+'\' target=\'_blank\' title=\'View in Pokedex\'>#'+pid+'</a></small> - <b>'+pokemonsJSON[poke.pokemon.PokemonId - 1]['Name']+'</b></div>'
+                            '<center class=\'label-countdown\' data-disappears-at=\''+ str(disappear_timestamp)+'\'>'+disappears_at+'</center>'
+                        )
+                if args.china:
+                    poke.Latitude, poke.Longitude = transform_from_wgs_to_gcj(Location(poke.Latitude, poke.Longitude))
+
+                pokemonSwap.append([poke.pokemon.PokemonId, label, poke.Latitude, poke.Longitude, poke.TimeTillHiddenMs]) #this is an aggregation of the entire list, and we will do a hotswap once all steps are finished
+                pokemons.append([poke.pokemon.PokemonId, label, poke.Latitude, poke.Longitude, poke.TimeTillHiddenMs]) #this allows us to read the list before its done
+
+            #Scan location math
+            if (-steplimit/2 < x <= steplimit/2) and (-steplimit/2 < y <= steplimit/2):
+                set_location_coords((x * 0.0025) + deflat, (y * 0.0025 ) + deflng, 0)
+            if x == y or (x < 0 and x == -y) or (x > 0 and x == 1-y):
+                dx, dy = -dy, dx
+            x, y = x+dx, y+dy
+            steps += 1
+
+    pokemons = pokemonSwap[:] #we do a slice to copy the list and replace the pokemon list as a whole
     register_background_thread()
+
 
 
 def register_background_thread(initial_registration=False):
@@ -548,11 +591,11 @@ def register_background_thread(initial_registration=False):
             return
 
         debug("register_background_thread: initial registration")
-        search_thread = threading.Thread(target=main)
+        search_thread = threading.Thread(target=performSearch)
 
     else:
         debug("register_background_thread: queueing")
-        search_thread = threading.Timer(30, main)  # delay, in seconds
+        search_thread = threading.Timer(30, performSearch)  # delay, in seconds
 
     search_thread.daemon = True
     search_thread.name = "search_thread"
@@ -570,19 +613,23 @@ app = create_app()
 
 @app.route('/')
 def fullmap():
+    global pokemons
     pokeMarkers = []
+    debug("loading %d pokemon" % len(pokemons))
     for pokemon in pokemons:
-        currLat, currLon = pokemon[-2], pokemon[-1]
+        currLat, currLon = pokemon[-3], pokemon[-2]
         imgnum = str(pokemon[0]);
         if len(imgnum) <= 2: imgnum = '0' + imgnum
         if len(imgnum) <= 2: imgnum = '0' + imgnum
-        pokeMarkers.append(
-            {
-                'icon': 'static/icons/'+str(pokemon[0])+'.png',
-                'lat': currLat,
-                'lng': currLon,
-                'infobox': pokemon[1]
-                })
+
+        if (pokemon[-1] > 0): #TimeTillHiddenMs
+            pokeMarkers.append(
+                {
+                    'icon': 'static/icons/'+str(pokemon[0])+'.png',
+                    'lat': currLat,
+                    'lng': currLon,
+                    'infobox': pokemon[1]
+                    })
     for gym in gyms:
         if gym[0] == 0: color = "white"
         if gym[0] == 1: color = "rgba(0, 0, 256, .1)"
@@ -620,8 +667,13 @@ def fullmap():
     )
     return render_template('example_fullmap.html', fullmap=fullmap)
 
-
 if __name__ == "__main__":
+
+    #load static resourcing
+    full_path = os.path.realpath(__file__)
+    path, filename = os.path.split(full_path)
+    pokemonsJSON = json.load(open(path + '/pokemon.json'))
+
     args = get_args()
     register_background_thread(initial_registration=True)
     app.run(debug=True, threaded=True, host=args.host, port=args.port)
